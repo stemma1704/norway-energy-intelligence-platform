@@ -1,0 +1,11 @@
+env/
+.env
+__pycache__/
+*.pyc
+
+data/bronze/
+data/silver/
+data/gold/
+
+.DS_Store
+Thumbs.db
