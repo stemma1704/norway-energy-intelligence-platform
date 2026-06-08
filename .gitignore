@@ -9,3 +9,10 @@ data/gold/
 
 .DS_Store
 Thumbs.db
+
+# Airflow local files
+airflow/logs/
+airflow/plugins/
+airflow/airflow.db
+airflow/webserver_config.py
+airflow/standalone_admin_password.txt
