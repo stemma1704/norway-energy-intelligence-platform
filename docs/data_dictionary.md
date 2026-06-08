@@ -18,6 +18,7 @@ The purpose of this document is to clearly describe:
 * What each field means
 * Whether the field should be used in the Silver transformation layer
 * Why some fields are selected and others are ignored
+* How raw API timestamps are preserved while readable date/time fields are added
 
 The Silver layer will transform raw JSON into clean tabular datasets that can later be joined in the Gold layer and used in Power BI.
 
@@ -25,19 +26,19 @@ The Silver layer will transform raw JSON into clean tabular datasets that can la
 
 ## 2. Quick view
 
-| Source            | File Type   | Data Grain                              | Main Use                           |
-| ----------------- | ----------- | --------------------------------------- | ---------------------------------- |
-| Electricity API ⚡ | JSON list   | One row per price area per hour         | Hourly electricity price analysis  |
-| Weather API 🌦️   | Nested JSON | One row per city per forecast timestamp | Weather context for price analysis |
+| Source            | Bronze File Type                 | Data Grain                              | Main Use                           |
+| ----------------- | -------------------------------- | --------------------------------------- | ---------------------------------- |
+| Electricity API ⚡ | Consolidated daily JSON          | One row per price area per hour         | Hourly electricity price analysis  |
+| Weather API 🌦️   | Consolidated daily snapshot JSON | One row per city per forecast timestamp | Weather context for price analysis |
 
 ---
 
 ## 3. Data flow
 
 ```text
-⚡ Electricity JSON      🌦️ Weather JSON
+⚡ Electricity API        🌦️ Weather API
         ↓                     ↓
-        🥉 Bronze Layer: raw API data
+        🥉 Bronze Layer: consolidated raw JSON files
                   ↓
         🥈 Silver Layer: cleaned tables
                   ↓
@@ -65,63 +66,106 @@ The Silver layer will transform raw JSON into clean tabular datasets that can la
 
 ### File description
 
-The electricity file contains hourly electricity prices for one Norwegian price area and one date.
+The electricity Bronze file is stored as **one consolidated JSON file per price date**.
 
 Example Bronze file:
 
 ```text
-data/bronze/electricity_prices/2026-06-06_NO1.json
+data/bronze/electricity_prices/price_date=2026-06-06.json
 ```
 
-This filename tells us:
+This file contains:
 
-| Part         | Meaning                          |
-| ------------ | -------------------------------- |
-| `2026-06-06` | Date of the electricity prices   |
-| `NO1`        | Norwegian electricity price area |
+* All five Norwegian price areas: NO1, NO2, NO3, NO4, NO5
+* Around 24 hourly records per price area
+* Around 120 electricity price records per price date
+* One or more extraction runs
+* Raw API timestamps preserved
+* Additional readable date/time helper fields added by our extraction script
 
-The file normally contains around 24 records, one for each hour of the day.
+This structure is cleaner than storing one JSON file per price area because one daily file now contains all electricity price data for that date.
 
-Example record:
+---
+
+## 6. Electricity Bronze JSON structure
+
+Example structure:
 
 ```json
 {
-  "NOK_per_kWh": 1.19029,
-  "EUR_per_kWh": 0.10976,
-  "EXR": 10.8445,
-  "time_start": "2026-06-06T00:00:00+02:00",
-  "time_end": "2026-06-06T01:00:00+02:00"
+  "price_date": "2026-06-06",
+  "source": "hvakosterstrommen",
+  "description": "Consolidated raw electricity price API data for all Norwegian price areas. Raw API timestamp values are preserved and readable date/time helper fields are added.",
+  "extraction_runs": [
+    {
+      "extracted_at_raw": "2026-06-06T14:05:22+02:00",
+      "extracted_date": "2026-06-06",
+      "extracted_time": "14:05:22",
+      "price_date": "2026-06-06",
+      "record_count": 120,
+      "records": [
+        {
+          "price_area": "NO1",
+          "price_area_name": "Eastern Norway / Oslo",
+          "time_start_raw": "2026-06-06T00:00:00+02:00",
+          "time_end_raw": "2026-06-06T01:00:00+02:00",
+          "date": "2026-06-06",
+          "start_time": "00:00:00",
+          "end_time": "01:00:00",
+          "hour": 0,
+          "hour_label": "00:00 - 01:00",
+          "NOK_per_kWh": 1.19029,
+          "EUR_per_kWh": 0.10976,
+          "EXR": 10.8445
+        }
+      ]
+    }
+  ]
 }
 ```
 
 ---
 
-## 6. Electricity data fields
+## 7. Electricity data fields
 
-| Raw Field            | Meaning                                                                                                                                                                                            | Use in Silver Layer?                                                                                                                                                                         |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NOK_per_kWh`        | Electricity price in Norwegian kroner per kilowatt-hour. Example: `1.19029` means 1 kWh costs about 1.19029 NOK during that hour. This is the most understandable price field for Norwegian users. | ✅ **Yes — core field.** Becomes `nok_per_kwh`. Used for average price, max price, min price, hourly price trend, and cheap/expensive hour analysis.                                          |
-| `EUR_per_kWh`        | Electricity price in euros per kilowatt-hour. This is useful because Nordic and European electricity markets often use euro-based pricing.                                                         | 🟡 **Yes — supporting field.** Becomes `eur_per_kwh`. Not the main MVP metric, but useful for future European market comparison and validation.                                              |
-| `EXR`                | Exchange rate used between EUR and NOK. Example: `10.8445` means 1 EUR is approximately 10.8445 NOK.                                                                                               | 🟡 **Yes — supporting field.** Becomes `exchange_rate`. Helps explain the relationship between EUR and NOK prices.                                                                           |
-| `time_start`         | Start timestamp of the hourly electricity price interval. Example: `2026-06-06T00:00:00+02:00`. The `+02:00` means Norway local time is two hours ahead of UTC during summer time.                 | ✅ **Yes — core field.** Becomes `timestamp_start_raw` and `timestamp_start_local`. We also derive `date`, `time`, and `hour` from it. Required for hourly analysis and joining with weather. |
-| `time_end`           | End timestamp of the hourly electricity price interval. Example: `2026-06-06T01:00:00+02:00`. Together with `time_start`, this defines the valid price window.                                     | ✅ **Yes — core field.** Becomes `timestamp_end_raw` and `timestamp_end_local`. Used to create `hour_label`, such as `00:00 - 01:00`.                                                         |
-| File name date       | Date included in the filename, such as `2026-06-06`. This confirms which date the raw file belongs to.                                                                                             | 🔵 **Optional metadata.** Useful for validation, but the preferred analytical date comes from parsed `time_start`.                                                                           |
-| File name price area | Price area included in the filename, such as `NO1`. This is not inside each JSON record, so we extract it from the filename.                                                                       | ✅ **Yes — core field.** Becomes `price_area`. Required for comparing NO1–NO5 and joining with weather data.                                                                                  |
-| Price area name      | Human-readable name based on the price area code. Example: `NO1` = Eastern Norway / Oslo. This is added using our own mapping table.                                                               | ✅ **Yes — core field.** Becomes `price_area_name`. Makes Power BI visuals easier to understand.                                                                                              |
-| Source file          | Name of the raw JSON file that produced the row. Example: `2026-06-06_NO1.json`.                                                                                                                   | 🔵 **Yes — metadata field.** Becomes `source_file`. Useful for debugging and data lineage.                                                                                                   |
-| Processed timestamp  | Time when our Python transformation processed the row. This is not from the API; we create it during transformation.                                                                               | 🔵 **Yes — metadata field.** Becomes `processed_at`. Helps track when the Silver table was created.                                                                                          |
+| Raw Field / Section | Meaning                                                                                                                                                               | Use in Silver Layer?                                                                                                   |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `price_date`        | The date the electricity prices belong to. Example: `2026-06-06`. This is the business date of the electricity price, not necessarily the date we collected the data. | ✅ **Yes — core field.** Becomes `price_date`. Useful for filtering, validation, and historical backfill.               |
+| `source`            | Name of the data source. Example: `hvakosterstrommen`.                                                                                                                | 🔵 **Yes — metadata field.** Useful for data lineage and documentation.                                                |
+| `description`       | Human-readable explanation of what the Bronze file contains.                                                                                                          | ❌ **No — ignored for analytics.** Useful in raw JSON but not needed in Silver tables.                                  |
+| `extraction_runs`   | List of API extraction attempts/runs stored inside the daily file. If the same day is collected more than once, multiple runs can exist.                              | ✅ **Yes — core structure.** Silver reads records from this list.                                                       |
+| `extracted_at_raw`  | Exact timestamp when our pipeline collected the data. Example: `2026-06-06T14:05:22+02:00`.                                                                           | 🔵 **Yes — metadata field.** Becomes `extracted_at_raw`. Useful for lineage and debugging.                             |
+| `extracted_date`    | Date when the pipeline collected the data. Example: `2026-06-06`.                                                                                                     | 🔵 **Yes — metadata field.** Useful for tracking when data was pulled.                                                 |
+| `extracted_time`    | Time when the pipeline collected the data. Example: `14:05:22`.                                                                                                       | 🔵 **Yes — metadata field.** Useful for checking whether the morning or afternoon extraction produced the data.        |
+| `record_count`      | Number of records collected in that extraction run. For a normal full day: `5 price areas × 24 hours = 120 records`.                                                  | 🔵 **Optional metadata field.** Useful for validation.                                                                 |
+| `records`           | List of hourly electricity price records for all price areas.                                                                                                         | ✅ **Yes — core structure.** Silver loops through this list to create rows.                                             |
+| `price_area`        | Norwegian electricity price area code. Examples: `NO1`, `NO2`, `NO3`, `NO4`, `NO5`.                                                                                   | ✅ **Yes — core field.** Becomes `price_area`. Required for comparing regions and joining with weather.                 |
+| `price_area_name`   | Human-readable name for the price area. Example: `NO1` = `Eastern Norway / Oslo`.                                                                                     | ✅ **Yes — core field.** Becomes `price_area_name`. Makes Power BI visuals easier to understand.                        |
+| `time_start_raw`    | Original API start timestamp for the hourly price interval. Example: `2026-06-06T00:00:00+02:00`. This preserves timezone information.                                | ✅ **Yes — core field.** Becomes `timestamp_start_raw` and `timestamp_start_local`. Used for time analysis.             |
+| `time_end_raw`      | Original API end timestamp for the hourly price interval. Example: `2026-06-06T01:00:00+02:00`.                                                                       | ✅ **Yes — core field.** Becomes `timestamp_end_raw` and `timestamp_end_local`. Used to define the hourly price window. |
+| `date`              | Readable local date derived from `time_start_raw`. Example: `2026-06-06`.                                                                                             | ✅ **Yes — core field.** Becomes `date`. Used for filtering, grouping, and joining with weather.                        |
+| `start_time`        | Readable local start time derived from `time_start_raw`. Example: `00:00:00`.                                                                                         | ✅ **Yes — core field.** Becomes `time`. Used for display and hourly analysis.                                          |
+| `end_time`          | Readable local end time derived from `time_end_raw`. Example: `01:00:00`.                                                                                             | 🟡 **Yes — supporting field.** Used to create or validate `hour_label`.                                                |
+| `hour`              | Numeric hour extracted from the local start time. Example: `0` for midnight, `15` for 15:00.                                                                          | ✅ **Yes — core field.** Becomes `hour`. Required for hourly joins and sorting.                                         |
+| `hour_label`        | User-friendly hourly interval. Example: `00:00 - 01:00`.                                                                                                              | ✅ **Yes — core field.** Becomes `hour_label`. Useful for Power BI axis labels and tooltips.                            |
+| `NOK_per_kWh`       | Electricity price in Norwegian kroner per kilowatt-hour. Example: `1.19029` means 1 kWh costs about 1.19029 NOK during that hour.                                     | ✅ **Yes — core field.** Becomes `nok_per_kwh`. Main KPI for the dashboard.                                             |
+| `EUR_per_kWh`       | Electricity price in euros per kilowatt-hour. Useful because Nordic and European electricity markets often use euro-based pricing.                                    | 🟡 **Yes — supporting field.** Becomes `eur_per_kwh`. Useful for future European market comparison.                    |
+| `EXR`               | Exchange rate used between EUR and NOK. Example: `10.8445` means 1 EUR is approximately 10.8445 NOK.                                                                  | 🟡 **Yes — supporting field.** Becomes `exchange_rate`. Helps explain the relationship between EUR and NOK prices.     |
+| `source_file`       | Name of the Bronze JSON file that produced the row. Example: `price_date=2026-06-06.json`.                                                                            | 🔵 **Yes — metadata field.** Created in Silver as `source_file`. Useful for debugging and data lineage.                |
+| `processed_at`      | Time when our Python transformation processed the row. This is created during Silver transformation, not by the API.                                                  | 🔵 **Yes — metadata field.** Becomes `processed_at`. Helps track when Silver was created.                              |
 
 ---
 
-## 7. Why these electricity fields matter
+## 8. Why these electricity fields matter
 
 The electricity table gives us three essential things:
 
-| Concept                | Field Examples                  | Why it matters                                      |
-| ---------------------- | ------------------------------- | --------------------------------------------------- |
-| Price                  | `NOK_per_kWh`, `EUR_per_kWh`    | Shows how expensive electricity is during each hour |
-| Time                   | `time_start`, `time_end`        | Shows when each price is valid                      |
-| Location / market area | `price_area`, `price_area_name` | Allows comparison across Norwegian price areas      |
+| Concept                | Field Examples                                                 | Why it matters                                      |
+| ---------------------- | -------------------------------------------------------------- | --------------------------------------------------- |
+| Price                  | `NOK_per_kWh`, `EUR_per_kWh`                                   | Shows how expensive electricity is during each hour |
+| Time                   | `time_start_raw`, `time_end_raw`, `date`, `hour`, `hour_label` | Shows when each price is valid                      |
+| Location / market area | `price_area`, `price_area_name`                                | Allows comparison across Norwegian price areas      |
+| Lineage                | `extracted_at_raw`, `source_file`, `processed_at`              | Helps track when data was collected and transformed |
 
 Together, these fields allow us to answer:
 
@@ -129,16 +173,39 @@ Together, these fields allow us to answer:
 * Which hour is most expensive?
 * Which price area has the highest price?
 * How do prices change during the day?
+* When was the data collected?
+* Which raw file produced this row?
 
 ---
 
 # Weather Data 🌦️
 
-## 8. Weather data file
+## 9. Weather data file
 
 ### File description
 
-The weather file contains forecast data for one location.
+The weather Bronze file is stored as **one consolidated JSON file per extraction date**.
+
+Example Bronze file:
+
+```text
+data/bronze/weather_forecast/extraction_date=2026-06-06.json
+```
+
+This file contains:
+
+* One extraction date
+* One or more weather forecast snapshots for that date
+* All representative cities in each snapshot
+* The original MET Norway API response for each city
+* Raw UTC forecast timestamps preserved
+* Additional Norway local date/time fields added by our extraction script
+
+Weather forecasts are snapshots. If the API is called multiple times in a day, each run is appended to the same daily weather file under `snapshots`.
+
+---
+
+## 10. Weather city mapping
 
 In this project, each electricity price area is represented by one city.
 
@@ -150,99 +217,143 @@ In this project, each electricity price area is represented by one city.
 | NO4        | Tromsø              |
 | NO5        | Bergen              |
 
-Example Bronze file:
+---
 
-```text
-data/bronze/weather_forecast/2026-06-06_NO1_Oslo.json
+## 11. Weather Bronze JSON structure
+
+Example structure:
+
+```json
+{
+  "extraction_date": "2026-06-06",
+  "source": "met_norway_locationforecast",
+  "description": "Daily consolidated weather forecast snapshots. Each snapshot contains all representative cities and preserves the raw API response while adding readable local time fields.",
+  "snapshots": [
+    {
+      "extracted_at_raw": "2026-06-06T15:00:00+02:00",
+      "extracted_date": "2026-06-06",
+      "extracted_time": "15:00:00",
+      "extracted_hour": 15,
+      "location_count": 5,
+      "locations": [
+        {
+          "price_area": "NO1",
+          "city": "Oslo",
+          "latitude": 59.9139,
+          "longitude": 10.7522,
+          "api_response": {
+            "type": "Feature",
+            "geometry": {
+              "type": "Point",
+              "coordinates": [10.7522, 59.9139, 5]
+            },
+            "properties": {
+              "meta": {
+                "updated_at": "2026-06-06T13:27:40Z"
+              },
+              "timeseries": [
+                {
+                  "time": "2026-06-06T13:00:00Z",
+                  "forecast_time_raw": "2026-06-06T13:00:00Z",
+                  "forecast_time_local": "2026-06-06T15:00:00+02:00",
+                  "local_date": "2026-06-06",
+                  "local_time": "15:00:00",
+                  "local_hour": 15,
+                  "local_hour_label": "15:00 - 16:00",
+                  "data": {
+                    "instant": {
+                      "details": {
+                        "air_temperature": 21.0,
+                        "wind_speed": 3.8,
+                        "cloud_area_fraction": 53.5
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
 ```
-
-This filename tells us:
-
-| Part         | Meaning                                      |
-| ------------ | -------------------------------------------- |
-| `2026-06-06` | Date when the data was extracted             |
-| `NO1`        | Electricity price area                       |
-| `Oslo`       | Representative city for the weather forecast |
-
-The weather JSON is nested. A simplified structure looks like this:
-
-```text
-type
-geometry
-properties
-    ├── meta
-    │   ├── updated_at
-    │   └── units
-    └── timeseries
-        ├── time
-        └── data
-            ├── instant
-            │   └── details
-            ├── next_1_hours
-            ├── next_6_hours
-            └── next_12_hours
-```
-
-The most important part is:
-
-```text
-properties.timeseries
-```
-
-Each item inside `timeseries` is one forecast timestamp.
 
 ---
 
-## 9. Weather data fields
+## 12. Weather data fields
 
-| Raw Field / Section                              | Meaning                                                                                                                                                | Use in Silver Layer?                                                                                                                                                          |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `type`                                           | Describes the type of object returned by the API. Example: `Feature`. This is API/geospatial metadata.                                                 | ❌ **No — ignored for MVP.** It is not needed for energy or weather analysis in the first version.                                                                             |
-| `geometry.coordinates`                           | Location coordinates for the forecast point. Example: `[10.7522, 59.9139, 5]`. The order is longitude, latitude, altitude.                             | 🟡 **Partially yes.** We keep latitude and longitude as `latitude` and `longitude`. Altitude is ignored for the MVP.                                                          |
-| `properties.meta.updated_at`                     | Timestamp showing when the weather forecast was last updated by the provider. Example: `2026-06-06T13:27:40Z`. The `Z` means UTC time.                 | 🔵 **Yes — metadata field.** Becomes `weather_updated_at_utc`. Useful for data freshness and pipeline monitoring.                                                             |
-| `properties.meta.units`                          | Contains measurement units for weather fields, such as Celsius for temperature, m/s for wind speed, percent for cloud cover, and mm for precipitation. | ❌ **No as a separate field.** Instead, we include units directly in Silver column names, such as `air_temperature_celsius`, `wind_speed_mps`, and `precipitation_next_1h_mm`. |
-| `properties.timeseries[].time`                   | Forecast timestamp. Example: `2026-06-06T13:00:00Z`. The `Z` means the time is in UTC.                                                                 | ✅ **Yes — core field.** Becomes `forecast_time_raw`, `forecast_time_utc`, and `forecast_time_local`. We also derive `date`, `time`, and `hour` from the local timestamp.      |
-| `data.instant.details.air_temperature`           | Forecasted air temperature at the exact timestamp. Unit: Celsius. Example: `21.0`.                                                                     | ✅ **Yes — core field.** Becomes `air_temperature_celsius`. Important because temperature may influence electricity demand.                                                    |
-| `data.instant.details.wind_speed`                | Forecasted wind speed at the exact timestamp. Unit: metres per second. Example: `3.8`.                                                                 | ✅ **Yes — core field.** Becomes `wind_speed_mps`. Wind is useful weather context and may be relevant for energy market analysis.                                              |
-| `data.instant.details.wind_from_direction`       | Direction the wind is coming from, measured in degrees. Example: `190.0` means roughly from the south.                                                 | 🟡 **Yes — supporting field.** Becomes `wind_from_direction_degrees`. Kept for completeness and future weather analysis.                                                      |
-| `data.instant.details.cloud_area_fraction`       | Percentage of sky covered by clouds. Example: `53.5` means 53.5% cloud cover.                                                                          | 🟡 **Yes — supporting field.** Becomes `cloud_area_fraction_pct`. Gives useful weather context and may support future solar-related analysis.                                 |
-| `data.instant.details.relative_humidity`         | Moisture level in the air as a percentage. Example: `54.2` means 54.2% humidity.                                                                       | 🟡 **Yes — supporting field.** Becomes `relative_humidity_pct`. Useful supporting weather context.                                                                            |
-| `data.instant.details.air_pressure_at_sea_level` | Air pressure adjusted to sea level. Unit: hPa. Example: `1011.9`.                                                                                      | 🟡 **Yes — supporting field.** Becomes `air_pressure_hpa`. Useful for describing weather systems, though optional for the first dashboard.                                    |
-| `data.next_1_hours.summary.symbol_code`          | Short weather condition code for the next 1 hour. Examples: `clearsky_day`, `partlycloudy_day`, `cloudy`, `rain`.                                      | ✅ **Yes — core field.** Becomes `weather_symbol_next_1h`. Useful for readable weather labels and Power BI tooltips.                                                           |
-| `data.next_1_hours.details.precipitation_amount` | Expected precipitation during the next 1 hour. Unit: millimetres. Example: `0.0`.                                                                      | ✅ **Yes — core field.** Becomes `precipitation_next_1h_mm`. Best precipitation field for the MVP because electricity prices are also hourly.                                  |
-| `data.next_6_hours.summary.symbol_code`          | Weather condition code for the next 6 hours. This gives a medium-term weather summary.                                                                 | 🟡 **Yes — supporting field.** Becomes `weather_symbol_next_6h`. Useful for forecast overview pages, but less important than `next_1_hours`.                                  |
-| `data.next_6_hours.details.precipitation_amount` | Expected precipitation during the next 6 hours. Unit: millimetres.                                                                                     | 🟡 **Yes — supporting field.** Becomes `precipitation_next_6h_mm`. Gives broader precipitation context.                                                                       |
-| `data.next_12_hours.summary.symbol_code`         | Weather condition code for the next 12 hours. This gives a longer weather summary.                                                                     | 🟡 **Yes — optional field.** Becomes `weather_symbol_next_12h`. Useful for high-level forecast context but not central to hourly analysis.                                    |
-| `data.next_12_hours.details`                     | Details for the next 12 hours. In many rows, this is empty.                                                                                            | ❌ **No — ignored for MVP.** Often empty and not useful for the first version.                                                                                                 |
-| File name date                                   | Date included in the filename, such as `2026-06-06`. This is the extraction date, not necessarily the forecast date for every row.                     | 🔵 **Optional metadata.** Useful for file tracking, but forecast analysis should use `timeseries[].time`.                                                                     |
-| File name price area                             | Price area included in the filename, such as `NO1`. This links the weather city to an electricity price area.                                          | ✅ **Yes — core field.** Becomes `price_area`. Required for joining weather with electricity prices.                                                                           |
-| File name city                                   | City included in the filename, such as `Oslo`. This tells us which representative city the forecast belongs to.                                        | ✅ **Yes — core field.** Becomes `city`. Makes the weather data easier to interpret.                                                                                           |
-| Source file                                      | Name of the raw JSON file that produced the row. Example: `2026-06-06_NO1_Oslo.json`.                                                                  | 🔵 **Yes — metadata field.** Becomes `source_file`. Supports debugging and data lineage.                                                                                      |
-| Processed timestamp                              | Time when our Python transformation processed the row. This is created by our pipeline.                                                                | 🔵 **Yes — metadata field.** Becomes `processed_at`. Helps track when the Silver table was created.                                                                           |
+| Raw Field / Section                              | Meaning                                                                                                             | Use in Silver Layer?                                                                                                        |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `extraction_date`                                | Date when the daily weather Bronze file was created. Example: `2026-06-06`.                                         | 🔵 **Yes — metadata field.** Useful for tracking the daily weather snapshot file.                                           |
+| `source`                                         | Name of the weather data source. Example: `met_norway_locationforecast`.                                            | 🔵 **Yes — metadata field.** Useful for data lineage.                                                                       |
+| `description`                                    | Human-readable explanation of what the Bronze file contains.                                                        | ❌ **No — ignored for analytics.** Useful in raw JSON but not needed in Silver.                                              |
+| `snapshots`                                      | List of weather API extraction runs for the day. Each snapshot represents one API call time.                        | ✅ **Yes — core structure.** Silver reads from this list.                                                                    |
+| `extracted_at_raw`                               | Exact timestamp when the weather API snapshot was collected. Example: `2026-06-06T15:00:00+02:00`.                  | 🔵 **Yes — metadata field.** Becomes `extracted_at_raw`. Useful for tracking forecast snapshots.                            |
+| `extracted_date`                                 | Date when the weather snapshot was collected.                                                                       | 🔵 **Yes — metadata field.** Useful for lineage and monitoring.                                                             |
+| `extracted_time`                                 | Time when the weather snapshot was collected. Example: `15:00:00`.                                                  | 🔵 **Yes — metadata field.** Useful for knowing which API call produced the forecast.                                       |
+| `extracted_hour`                                 | Hour when the snapshot was collected. Example: `15`.                                                                | 🔵 **Yes — metadata field.** Useful for snapshot-level analysis.                                                            |
+| `location_count`                                 | Number of city/location API responses collected in the snapshot. Expected value is usually `5`.                     | 🔵 **Optional metadata field.** Useful for validation.                                                                      |
+| `locations`                                      | List of representative cities collected in the snapshot.                                                            | ✅ **Yes — core structure.** Silver loops through this list.                                                                 |
+| `price_area`                                     | Norwegian electricity price area connected to the weather city. Example: `NO1`.                                     | ✅ **Yes — core field.** Becomes `price_area`. Required for joining with electricity prices.                                 |
+| `city`                                           | Representative city for the weather forecast. Example: `Oslo`.                                                      | ✅ **Yes — core field.** Becomes `city`. Useful for dashboard labels.                                                        |
+| `latitude`                                       | Latitude of the representative city.                                                                                | 🟡 **Yes — supporting field.** Becomes `latitude`. Useful for map visuals.                                                  |
+| `longitude`                                      | Longitude of the representative city.                                                                               | 🟡 **Yes — supporting field.** Becomes `longitude`. Useful for map visuals.                                                 |
+| `api_response`                                   | Original MET Norway API response for the location.                                                                  | ✅ **Yes — core structure.** Silver extracts forecast records from this object.                                              |
+| `type`                                           | Describes the type of object returned by the API. Example: `Feature`.                                               | ❌ **No — ignored for MVP.** API/geospatial metadata not needed for the first dashboard.                                     |
+| `geometry.coordinates`                           | Location coordinates from the API response. Order is longitude, latitude, altitude.                                 | 🟡 **Partially yes.** We already store latitude and longitude at location level. Altitude is ignored for MVP.               |
+| `properties.meta.updated_at`                     | Timestamp showing when the weather forecast was last updated by the provider. Example: `2026-06-06T13:27:40Z`.      | 🔵 **Yes — metadata field.** Becomes `weather_updated_at_utc`. Useful for data freshness.                                   |
+| `properties.meta.units`                          | Measurement units for weather fields, such as Celsius, m/s, percent, and millimetres.                               | ❌ **No as a separate field.** Units are added into Silver column names, such as `air_temperature_celsius`.                  |
+| `properties.timeseries`                          | List of forecast records. Each item represents one forecast timestamp.                                              | ✅ **Yes — core structure.** Silver creates one row per forecast timestamp.                                                  |
+| `properties.timeseries[].time`                   | Original MET Norway UTC forecast timestamp. Example: `2026-06-06T13:00:00Z`. This raw API field is not overwritten. | ✅ **Yes — core field.** Becomes `forecast_time_utc` and is also preserved as raw time reference.                            |
+| `forecast_time_raw`                              | Copy of the original UTC forecast timestamp. Example: `2026-06-06T13:00:00Z`.                                       | ✅ **Yes — core field.** Becomes `forecast_time_raw`. Useful for preserving the API timestamp.                               |
+| `forecast_time_local`                            | Forecast timestamp converted to Norway local time. Example: `2026-06-06T15:00:00+02:00`.                            | ✅ **Yes — core field.** Becomes `forecast_time_local`. Required for joining with electricity prices.                        |
+| `local_date`                                     | Norway local date derived from `forecast_time_local`. Example: `2026-06-06`.                                        | ✅ **Yes — core field.** Becomes `date`. Used for joins and filters.                                                         |
+| `local_time`                                     | Norway local time derived from `forecast_time_local`. Example: `15:00:00`.                                          | ✅ **Yes — core field.** Becomes `time`. Used for display and analysis.                                                      |
+| `local_hour`                                     | Norway local hour derived from `forecast_time_local`. Example: `15`.                                                | ✅ **Yes — core field.** Becomes `hour`. Required for hourly joins with electricity.                                         |
+| `local_hour_label`                               | User-friendly hourly interval. Example: `15:00 - 16:00`.                                                            | ✅ **Yes — core field.** Becomes `hour_label`. Useful in Power BI.                                                           |
+| `data.instant.details.air_temperature`           | Forecasted air temperature at the exact timestamp. Unit: Celsius. Example: `21.0`.                                  | ✅ **Yes — core field.** Becomes `air_temperature_celsius`. Important because temperature may influence electricity demand.  |
+| `data.instant.details.wind_speed`                | Forecasted wind speed at the exact timestamp. Unit: metres per second. Example: `3.8`.                              | ✅ **Yes — core field.** Becomes `wind_speed_mps`. Useful weather and energy context.                                        |
+| `data.instant.details.wind_from_direction`       | Direction the wind is coming from, measured in degrees. Example: `190.0`.                                           | 🟡 **Yes — supporting field.** Becomes `wind_from_direction_degrees`. Useful for future weather analysis.                   |
+| `data.instant.details.cloud_area_fraction`       | Percentage of sky covered by clouds. Example: `53.5` means 53.5% cloud cover.                                       | 🟡 **Yes — supporting field.** Becomes `cloud_area_fraction_pct`. Useful weather context.                                   |
+| `data.instant.details.relative_humidity`         | Moisture level in the air as a percentage. Example: `54.2`.                                                         | 🟡 **Yes — supporting field.** Becomes `relative_humidity_pct`. Useful supporting weather context.                          |
+| `data.instant.details.air_pressure_at_sea_level` | Air pressure adjusted to sea level. Unit: hPa. Example: `1011.9`.                                                   | 🟡 **Yes — supporting field.** Becomes `air_pressure_hpa`. Useful for describing weather systems.                           |
+| `data.next_1_hours.summary.symbol_code`          | Weather condition code for the next 1 hour. Examples: `clearsky_day`, `partlycloudy_day`, `cloudy`, `rain`.         | ✅ **Yes — core field.** Becomes `weather_symbol_next_1h`. Useful for readable weather labels and tooltips.                  |
+| `data.next_1_hours.details.precipitation_amount` | Expected precipitation during the next 1 hour. Unit: millimetres. Example: `0.0`.                                   | ✅ **Yes — core field.** Becomes `precipitation_next_1h_mm`. Best precipitation field because electricity prices are hourly. |
+| `data.next_6_hours.summary.symbol_code`          | Weather condition code for the next 6 hours.                                                                        | 🟡 **Yes — supporting field.** Becomes `weather_symbol_next_6h`. Useful for forecast overview pages.                        |
+| `data.next_6_hours.details.precipitation_amount` | Expected precipitation during the next 6 hours. Unit: millimetres.                                                  | 🟡 **Yes — supporting field.** Becomes `precipitation_next_6h_mm`. Gives broader precipitation context.                     |
+| `data.next_12_hours.summary.symbol_code`         | Weather condition code for the next 12 hours.                                                                       | 🟡 **Yes — optional field.** Becomes `weather_symbol_next_12h`. Useful for high-level forecast context.                     |
+| `data.next_12_hours.details`                     | Details for the next 12 hours. In many rows, this can be empty.                                                     | ❌ **No — ignored for MVP.** Often empty and not useful for the first version.                                               |
+| `source_file`                                    | Name of the Bronze JSON file that produced the row. Example: `extraction_date=2026-06-06.json`.                     | 🔵 **Yes — metadata field.** Created in Silver as `source_file`. Supports debugging and lineage.                            |
+| `processed_at`                                   | Time when our Python transformation processed the row. This is created during Silver transformation.                | 🔵 **Yes — metadata field.** Becomes `processed_at`. Helps track when Silver was created.                                   |
 
 ---
 
-## 10. Why these weather fields matter
+## 13. Why these weather fields matter
 
 The weather table gives context around the electricity price.
 
-| Concept           | Field Examples                                  | Why it matters                                   |
-| ----------------- | ----------------------------------------------- | ------------------------------------------------ |
-| Temperature       | `air_temperature_celsius`                       | May influence heating demand                     |
-| Wind              | `wind_speed_mps`, `wind_from_direction_degrees` | Gives renewable/weather context                  |
-| Cloud cover       | `cloud_area_fraction_pct`                       | Helps describe general weather conditions        |
-| Precipitation     | `precipitation_next_1h_mm`                      | Aligns well with hourly price periods            |
-| Weather condition | `weather_symbol_next_1h`                        | Makes dashboard labels more readable             |
-| Time              | `forecast_time_utc`, `forecast_time_local`      | Required for correct hourly joins                |
-| Location          | `price_area`, `city`, `latitude`, `longitude`   | Connects weather data to electricity price areas |
+| Concept           | Field Examples                                           | Why it matters                                   |
+| ----------------- | -------------------------------------------------------- | ------------------------------------------------ |
+| Temperature       | `air_temperature_celsius`                                | May influence heating demand                     |
+| Wind              | `wind_speed_mps`, `wind_from_direction_degrees`          | Gives renewable/weather context                  |
+| Cloud cover       | `cloud_area_fraction_pct`                                | Helps describe general weather conditions        |
+| Precipitation     | `precipitation_next_1h_mm`                               | Aligns well with hourly price periods            |
+| Weather condition | `weather_symbol_next_1h`                                 | Makes dashboard labels more readable             |
+| Time              | `forecast_time_utc`, `forecast_time_local`, `local_hour` | Required for correct hourly joins                |
+| Location          | `price_area`, `city`, `latitude`, `longitude`            | Connects weather data to electricity price areas |
+| Snapshot metadata | `extracted_at_raw`, `extracted_hour`                     | Shows when the forecast was collected            |
 
 ---
 
-## 11. Time note: UTC vs Norway local time
+## 14. Time handling rule: raw + readable timestamps
 
 The electricity and weather APIs use different timestamp styles.
 
-Electricity API example:
+### Electricity API timestamp
+
+Example:
 
 ```text
 2026-06-06T15:00:00+02:00
@@ -250,13 +361,51 @@ Electricity API example:
 
 This is Norway local time. The `+02:00` means Norway is two hours ahead of UTC during summer time.
 
-Weather API example:
+In Bronze electricity, we keep the original timestamps:
+
+```text
+time_start_raw
+time_end_raw
+```
+
+And we add readable helper fields:
+
+```text
+date
+start_time
+end_time
+hour
+hour_label
+```
+
+---
+
+### Weather API timestamp
+
+Example:
 
 ```text
 2026-06-06T13:00:00Z
 ```
 
 This is UTC time. The `Z` means UTC.
+
+In Bronze weather, we keep the original API timestamp:
+
+```text
+time
+forecast_time_raw
+```
+
+And we add Norway local helper fields:
+
+```text
+forecast_time_local
+local_date
+local_time
+local_hour
+local_hour_label
+```
 
 These two timestamps can represent the same real-world moment:
 
@@ -270,12 +419,13 @@ In June, Norway uses summer time, so:
 13:00 UTC = 15:00 Norway local time
 ```
 
-This is very important because we will join electricity and weather by local date and local hour.
+This is very important because we join electricity and weather by local date and local hour.
 
 Therefore, in the Silver layer:
 
 * Electricity timestamps are already local
-* Weather timestamps must be converted from UTC to Norway local time
+* Weather timestamps are converted from UTC to Norway local time
+* The raw API timestamp is still preserved
 
 The final join in the Gold layer should use:
 
@@ -285,9 +435,11 @@ price_area + local date + local hour
 
 ---
 
-## 12. Final Silver layer outputs
+## 15. Final Silver layer outputs
 
 The Silver layer will produce two clean tables.
+
+---
 
 ### Silver electricity table
 
@@ -312,6 +464,13 @@ One row per price area per hour.
 Main fields:
 
 ```text
+source
+price_date
+extracted_at_raw
+extracted_date
+extracted_time
+timestamp_start_raw
+timestamp_end_raw
 timestamp_start_local
 timestamp_end_local
 date
@@ -352,11 +511,19 @@ One row per price area per forecast timestamp.
 Main fields:
 
 ```text
+source
+extraction_date
+extracted_at_raw
+extracted_date
+extracted_time
+extracted_hour
+forecast_time_raw
 forecast_time_utc
 forecast_time_local
 date
 time
 hour
+hour_label
 price_area
 city
 latitude
@@ -379,7 +546,21 @@ processed_at
 
 ---
 
-## 13. Summary
+## 16. Summary
+
+The Bronze layer now stores cleaner daily consolidated JSON files.
+
+Electricity Bronze:
+
+```text
+data/bronze/electricity_prices/price_date=YYYY-MM-DD.json
+```
+
+Weather Bronze:
+
+```text
+data/bronze/weather_forecast/extraction_date=YYYY-MM-DD.json
+```
 
 The Silver layer should not blindly copy everything from the raw JSON files.
 
@@ -394,10 +575,18 @@ Instead, it should keep fields that are useful for:
 The most important design decision is:
 
 ```text
+Keep raw API timestamps, but add readable local date/time helper fields.
+```
+
+This gives the project both:
+
+* **Traceability** — because raw timestamps are preserved
+* **Usability** — because readable date, time, hour, and hour labels are available
+
+For joining electricity and weather, the key rule is:
+
+```text
 Convert weather UTC timestamps into Norway local time before joining with electricity prices.
 ```
 
 This ensures that the weather and electricity data describe the same real-world hour.
-
----
-
